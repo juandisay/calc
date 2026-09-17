@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""calc — a safe, lightweight CLI calculator (no dependencies).
+
+Usage:
+  calc "2 + 3 * 4"      # evaluate an expression
+  calc 2 + 3 * 4        # same, arguments are joined automatically
+  echo "1+2" | calc     # read an expression from stdin
+  calc                  # interactive REPL mode (exit: quit / Ctrl-D)
+
+Operators : + - * / // % ** ^   (^ = power, same precedence as **)
+Functions : sqrt sin cos tan asin acos atan atan2 log ln log2 exp
+            abs round floor ceil trunc min max hypot deg rad fact
+            sum mul (sum(1,2,3), mul(2,3,4))
+Constants : pi e tau
+Numbers   : full precision — billions, trillions, up to thousands of digits
+            (no digit limit)
+REPL      : 'ans' = last result, 'help', 'quit'
+"""
+
+from __future__ import annotations
+
+import ast
+import io
+import math
+import sys
+import tokenize
+from typing import NoReturn
+
+# Full-precision integers: disable the 4300-digit int<->str conversion limit
+# (this API only exists in Python 3.10.7+/3.11; older versions still work,
+# only numbers >4300 digits cannot be printed).
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+# Long expressions (chains of tens of thousands of terms) need headroom in compile/eval.
+sys.setrecursionlimit(100_000)
+# Maximum AST depth safe for the compiler's C stack (checked iteratively in max_depth).
+MAX_DEPTH = 15_000
+
+FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "atan2": math.atan2,
+    "log": math.log10,
+    "ln": math.log,
+    "log2": math.log2,
+    "exp": math.exp,
+    "abs": abs,
+    "round": round,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "trunc": math.trunc,
+    "min": min,
+    "max": max,
+    "hypot": math.hypot,
+    "deg": math.degrees,
+    "rad": math.radians,
+    "fact": math.factorial,
+    "sum": lambda *args: sum(args),
+    "mul": lambda *args: math.prod(args),
+}
+
+CONSTANTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
+
+KNOWN_NAMES = frozenset(FUNCTIONS) | frozenset(CONSTANTS) | {"ans"}
+
+ALLOWED_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.BoolOp,
+    ast.Compare,
+    ast.Call,
+    ast.Name,
+    ast.Constant,
+    ast.Load,
+    ast.Tuple,
+    ast.List,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Pow,
+    ast.USub,
+    ast.UAdd,
+    ast.Not,
+    ast.And,
+    ast.Or,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.Eq,
+    ast.NotEq,
+)
+
+
+class CalcError(Exception):
+    """Expression error suitable for showing to the user."""
+
+
+ADDITIVE_OPS = frozenset({"+", "-"})
+MUL_OPS = frozenset({"*"})
+
+
+def flatten_pure_chain(src: str) -> str:
+    """Turn a pure chain of one operator class into a single function call.
+
+    Only if the ENTIRE expression at depth 0 is NUMBER (OP NUMBER)+ with OP
+    purely additive (+/-) or purely multiplicative (*): the left-associative
+    same-precedence chain is equivalent to a fold, and the AST depth
+    collapses from N to 2 — expression length is no longer limited.
+    Mixed expressions (e.g. 2+3*4) or ones containing ^/(/**) are left intact.
+    """
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, IndentationError):
+        return src
+    depth = 0
+    meaningful = []
+    for t in toks:
+        if t.type in (
+            tokenize.ENCODING,
+            tokenize.ENDMARKER,
+            tokenize.NL,
+            tokenize.NEWLINE,
+            tokenize.INDENT,
+            tokenize.DEDENT,
+        ):
+            continue
+        if t.type == tokenize.OP and t.string in "([{":
+            depth += 1
+            meaningful.append(None)
+            continue
+        if t.type == tokenize.OP and t.string in ")]}":
+            depth -= 1
+            meaningful.append(None)
+            continue
+        meaningful.append(t if depth == 0 else None)
+    if not meaningful or any(m is None for m in meaningful):
+        return src
+    ts = meaningful
+    k = 0
+    sign = ""
+    if ts[0].type == tokenize.OP and ts[0].string in ("+", "-"):
+        sign = ts[0].string
+        k = 1
+    if k >= len(ts) or ts[k].type != tokenize.NUMBER:
+        return src
+    nums = [sign + ts[k].string]
+    ops = []
+    j = k + 1
+    while j < len(ts):
+        if ts[j].type != tokenize.OP:
+            return src
+        op = ts[j].string
+        j += 1
+        if j >= len(ts) or ts[j].type != tokenize.NUMBER:
+            return src
+        ops.append(op)
+        nums.append("-" + ts[j].string if op == "-" else ts[j].string)
+        j += 1
+    if not ops:
+        return src
+    opset = set(ops)
+    if opset <= ADDITIVE_OPS:
+        return f"sum({', '.join(nums)})"
+    if opset == MUL_OPS:
+        return f"mul({', '.join(nums)})"
+    return src
+
+
+def max_depth(root: ast.AST) -> int:
+    """Maximum AST depth, computed iteratively (safe for long chains)."""
+    deepest = 0
+    stack = [(root, 1)]
+    while stack:
+        node, d = stack.pop()
+        if d > deepest:
+            deepest = d
+        stack.extend((c, d + 1) for c in ast.iter_child_nodes(node))
+    return deepest
+
+
+def validate(root: ast.AST, env: dict) -> None:
+    """Reject any AST node outside the whitelist (anti-injection).
+
+    Iterative (explicit stack) so that chains of thousands of terms never
+    touch Python's recursion limit.
+    """
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, ALLOWED_NODES):
+            frag = ast.unparse(node)[:80]
+            raise CalcError(f"'{frag}' is not supported")
+        if isinstance(node, ast.Call):
+            if node.keywords:
+                raise CalcError("keyword arguments are not supported")
+            if not isinstance(node.func, ast.Name):
+                raise CalcError("only direct function calls are supported")
+        if isinstance(node, ast.Name):
+            if node.id not in KNOWN_NAMES:
+                raise CalcError(f"unknown name: '{node.id}'")
+            if node.id == "ans" and "ans" not in env:
+                raise CalcError("ans is only available in REPL mode")
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+            raise CalcError("only numbers are allowed as values")
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def evaluate(expr: str, env: dict) -> int | float | bool:
+    try:
+        src = flatten_pure_chain(expr)
+        tree = ast.parse(src.replace("^", "**"), mode="eval")
+        if max_depth(tree) > MAX_DEPTH:
+            raise CalcError(
+                f"expression too long — maximum depth {MAX_DEPTH} "
+                "(±30,000 characters; split into several commands)"
+            )
+        validate(tree, env)
+        namespace = {"__builtins__": {}, **CONSTANTS, **FUNCTIONS, **env}
+        return eval(compile(tree, "<calc>", "eval"), namespace)
+    except SyntaxError as exc:
+        raise CalcError(f"invalid expression: {exc.msg}") from exc
+    except CalcError:
+        raise
+    except ZeroDivisionError:
+        raise CalcError("division by zero") from None
+    except OverflowError as exc:
+        raise CalcError("number too large") from exc
+    except RecursionError:
+        raise CalcError("expression too deeply nested") from None
+    except MemoryError:
+        raise CalcError("expression too large") from None
+    except ValueError as exc:
+        msg = "value outside the function domain" if "math domain" in str(exc) else str(exc)
+        raise CalcError(msg) from exc
+    except TypeError as exc:
+        if "NoneType" in str(exc):
+            raise CalcError("ans has no value yet — run an expression first") from exc
+        raise CalcError(str(exc)) from exc
+
+
+def format_result(value) -> str:
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return str(value)
+        # repr = shortest digits that round-trip; show trillions as
+        # 1500000000000, not 1.5e+12. Huge numbers stay exponential.
+        text = repr(value)
+        if "e" not in text and text.endswith(".0"):
+            text = text[:-2]
+        return text
+    return str(value)
+
+
+def repl() -> NoReturn:
+    env = {"ans": None}
+    print("calc — type an expression, 'help' for help, 'quit' to exit.")
+    while True:
+        try:
+            line = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("quit", "exit", "q"):
+            break
+        if line in ("help", "-h", "--help"):
+            print(__doc__)
+            continue
+        try:
+            value = evaluate(line, env)
+        except CalcError as exc:
+            print(f"error: {exc}")
+            continue
+        env["ans"] = value
+        print(format_result(value))
+    sys.exit(0)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 1:
+        expr = " ".join(argv[1:])
+        if expr in ("-h", "--help", "help"):
+            print(__doc__)
+            return 0
+    elif not sys.stdin.isatty():
+        expr = sys.stdin.read().strip()
+        if not expr:
+            print("no input", file=sys.stderr)
+            return 1
+    else:
+        repl()
+    env: dict = {}
+    try:
+        value = evaluate(expr, env)
+    except CalcError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(format_result(value))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
