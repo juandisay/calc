@@ -23,6 +23,40 @@ calc "2+2"
 
 Or run directly: `./calc "2+2"`.
 
+## GUI
+
+A PyQt6 desktop GUI (`calc_gui.py`) wraps the same engine — no duplicated logic:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install PyQt6
+.venv/bin/python calc_gui.py
+```
+
+Features: expression line with Enter to evaluate, ↑/↓ input history, a
+clickable history panel (click to reuse, double-click to re-run), a button
+pad for operators and functions, `ans`, and a Help dialog listing all
+functions. Errors render in red with the same friendly messages as the CLI.
+
+### Building the .dmg
+
+`build_dmg.sh` bundles the GUI with PyInstaller (venv must have
+`pyinstaller`), regenerates `calc.icns` if missing, ad-hoc signs the app,
+and wraps it as `dist/calc-1.0.0-<arch>.dmg` with an Applications alias for
+drag-to-install:
+
+```bash
+./build_dmg.sh
+open dist/calc-1.0.0-arm64.dmg
+```
+
+Notes:
+
+- The engine ships inside the bundle as `calc_engine/calc` — a data file
+  named `calc` would collide with the `calc` executable.
+- The bundle is signed ad-hoc (no Developer ID). On other Macs, Gatekeeper
+  may require right-click → Open on first launch.
+
 ## Usage
 
 ```bash
